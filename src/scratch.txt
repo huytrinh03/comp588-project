@@ -1,0 +1,450 @@
+import daft
+import networkx as nx
+from utils import tensor_mult, get_elements_last_axis
+
+class Learner:
+    def __init__(self, dataset):
+        self.dataset = dataset
+
+    # Helper function   
+    def is_topological(self, variables):
+        '''
+        args:
+        - variables: A list of variables whose marginal distribution is calculated.
+                     variables list must be respect the topological order
+
+        returns:
+        bool: indicating whether variables is in topological order
+        '''   
+        # Check if variables are in topological order
+        is_topological = False
+        topological_order = list(nx.topological_sort(self.dataset.bn))
+        index_variables = [topological_order.index(variable) for variable in variables]
+        if sorted(index_variables) == index_variables:
+            is_topological = True
+        return is_topological
+    
+    def to_topological_order(self, variables):
+        '''
+        args:
+        - variables: A list of variables in self.bn.nodes
+
+        returns: a list of variables in topological order
+        '''
+        # Check for valid variables
+        for variable in variables:
+            assert variable in self.dataset.bn.nodes
+
+        # Reorder variables by the topological order
+        topological_order = list(nx.topological_sort(self.dataset.bn))
+        return sorted(variables, key=topological_order.index)
+    
+    def reconstruct_model(self, estimate_func):
+        '''
+        Calculate every θ_x|U (where U is the set of x's parents) that parameterize the Bayesian network
+        '''
+        new_bn = self.dataset.bn.copy()
+        bn = self.dataset.bn
+        for x in list(bn.nodes):
+            U = self.to_topological_order(list(bn.predecessors(x)))
+            Y = self.to_topological_order(U + [x])
+            P_Y = estimate_func(Y)
+            
+            if len(U) == 0:
+                cpd = TabularCPD(variable=x, variable_card=2, values=P_Y.reshape((2,1)))
+                new_bn.add_cpds(cpd)
+            else:
+                # Calculate the conditional prob of x given U
+                P_U_reciprocal = 1. / np.clip(estimate_func(U), 1e-17, 2)
+                a_dims = list(range(P_Y.ndim - 1))
+                b_dims = list(range(P_U_reciprocal.ndim))
+                P_x_given_U = tensor_mult(P_Y, P_U_reciprocal, a_dims, b_dims)
+                # Calculate the CPD of x given U
+                cpd_values = get_elements_last_axis(P_x_given_U)
+                cpd_values = cpd_values / cpd_values.sum(axis=0)     # After this division, cpd might have nan due to division by 0
+                cpd_values = np.where(np.isnan(cpd_values), 0.5, cpd_values)
+                cpd = TabularCPD(variable=x, variable_card=2, values=cpd_values,
+                                 evidence=U, evidence_card=[2]*len(U))
+                # Add the cpd to new_bn
+                new_bn.add_cpds(cpd)
+        return new_bn
+
+class MCARLearner(Learner):
+    def __init__(self, dataset):
+        super().__init__(dataset)
+        # To be used by FMCAR only
+        self.cache = [None] * (2 ** len(list(self.dataset.bn.nodes)))
+
+    def dmcar(self, variables):
+        '''
+        args:
+        - variables: A list of variables whose marginal distribution is calculated
+
+        Calculate the marginal distribution P(variables)
+        '''
+        self.is_topological(variables)
+        dataset = self.dataset
+        data = dataset.partial_data
+
+        # Get the lists of missing and fully-observed variables
+        Y_m = [variable for variable in variables if variable in dataset.missing_variables]
+        Y_o = [variable for variable in variables if variable not in dataset.missing_variables]
+        R_Y_m = ["R" + variable for variable in Y_m]
+        proxy_Y_m = ["proxy" + variable for variable in Y_m]
+        
+        # Check if all the variable lists are in topological order - easy for debugging
+        for variable_list in [Y_o, Y_m]:
+            assert self.is_topological(variable_list), "{} is not in topological order".format(variable_list)
+        
+        # Conditioning the data on R_Y_m = 'ob'. Including only the columns in Y_o and proxy_Y_m
+        data = data[(data[R_Y_m] == 'ob').all(axis=1)]
+        data = data[proxy_Y_m + Y_o]
+        
+        # Calculate number of instances
+        N = len(data)
+
+        # Calculate the probabilities of each unique combination of Y_m values
+        probabilities = (data.value_counts() / N).reset_index(name='prob')
+        
+        # Match the above probabilities to a numpy array
+        marginals = np.zeros([2]*len(variables))
+        for _, row in probabilities.iterrows():
+            index = tuple([int(row.iloc[i]) for i in range(len(variables))])
+            marginals[index] = row['prob']
+        
+        return marginals
+
+    def fmcar(self, Y):
+        '''
+        args:
+        - variables: A list of variables whose marginal distribution is calculated
+
+        Calculate the marginal distribution P(variables)
+        '''
+        self.is_topological(Y)
+        dataset = self.dataset
+        data = dataset.partial_data
+        
+        if len(Y) == 0:
+            return 1
+        
+        topological_order = list(nx.topological_sort(self.dataset.bn))
+        cache_index = np.sum(np.array([2 ** topological_order.index(y) if y in Y else 0 for y in topological_order]))
+        if self.cache[cache_index] is not None:
+            return self.cache[cache_index]
+        
+        # Initialize set of estimates
+        estimates = []
+
+        for y in Y:
+            # list of y's parent
+            U = Y.copy()
+            U.remove(y)
+            
+            # Get the lists of missing and fully-observed Y
+            Y_m = [variable for variable in Y if variable in dataset.missing_variables]
+            R_Y_m = ["R" + variable for variable in Y_m]
+
+            # Check if all the variable lists are in topological order - easy for debugging
+            assert self.is_topological(Y_m), "Y_m is not in topological order"
+
+            # Conditioning the data on R_Y_m = 'ob'. Including only the columns in Y
+            deleted_data = data[(data[R_Y_m] == 'ob').all(axis=1)][Y]
+          
+            if deleted_data.empty:
+                self.cache[cache_index] = np.full(shape=[2]*len(Y), fill_value=1./2**len(Y))
+                return self.cache[cache_index]
+            
+            # Calculate P(y, U), P(U)
+            prob = (deleted_data.value_counts(normalize=True)).reset_index(name='prob')
+            
+            if len(U) >= 1:
+                prob_U = (deleted_data[U].value_counts(normalize=True)).reset_index(name='prob_U')
+                
+                # Merging the above 2 DataFrames on the U columns
+                prob_merged = prob.merge(prob_U, on=U, how='left')
+
+                # Match the above probabilities to a numpy array
+                P_y_given_U = np.zeros([2]*len(Y))
+                for i, row in prob_merged.iterrows():
+                    index = tuple(row.iloc[:-2].astype(int))
+                    P_y_given_U[index] = row['prob'] / row['prob_U']
+            else:
+                P_y_given_U = np.array(prob['prob'])
+
+            fmcar_u = self.fmcar(U)
+
+            if not isinstance(fmcar_u, int):
+                a_dims = list(range(P_y_given_U.ndim))
+                a_dims.remove(Y.index(y))
+                b_dims = list(range(fmcar_u.ndim))
+                estimates.append(tensor_mult(P_y_given_U, fmcar_u, a_dims, b_dims))
+            else:
+                estimates.append(P_y_given_U)
+        
+        self.cache[cache_index] = np.mean(estimates, axis=0)
+        
+        return self.cache[cache_index]
+
+class MARLearner(Learner):
+    def __init__(self, dataset):
+        super().__init__(dataset)
+
+    def dmar(self, Y):
+        '''
+        args:
+        - variables: A list of variables whose marginal distribution is calculated
+
+        Calculate the marginal distribution P(variables)
+        '''
+        pass
+
+    def fmar(self, Y):
+        '''
+        args:
+        - variables: A list of variables whose marginal distribution is calculated
+
+        Calculate the marginal distribution P(variables)
+        '''
+        self.is_topological(Y)
+        
+        dataset = self.dataset
+        data = dataset.partial_data
+
+        # Get the lists of missing and fully-observed Y
+        Y_m = [variable for variable in Y if variable in dataset.missing_variables]
+        Y_o = [variable for variable in Y if variable not in dataset.missing_variables]
+        X_o = [variable for variable in list(nx.topological_sort(self.dataset.bn)) if variable not in dataset.missing_variables]
+        X_o_prime = self.to_topological_order(list(set(X_o) - set(Y_o)))
+
+        # Check if all the variable lists are in topological order - easy for debugging
+        for variable_list in [Y_o, Y_m, X_o_prime, X_o]:
+            assert self.is_topological(variable_list), "{} is not in topological order".format(variable_list)
+        
+        # Initialize estimated P(X_o_prime, Y_o, Y_m)
+        P_X_o_prime_Y_o_Y_m = np.zeros([2] * len(X_o_prime + Y_o + Y_m))
+
+        # Calculate P(X_o)
+        prob_X_o = (data[X_o].value_counts(normalize=True)).reset_index(name='prob_X_o')
+        
+        for i, row in prob_X_o.iterrows():
+            partial_data = data[(data[X_o] == row.iloc[:-1]).all(axis=1)]
+            cache = [None] * (2 ** len(list(dataset.bn.nodes)))
+            fmcar = self.fmcar(Y_m, partial_data, cache)
+            index = tuple(row.iloc[:-1].astype(int))
+            P_X_o_prime_Y_o_Y_m[index] = row['prob_X_o'] * fmcar
+        
+        # Sum out along the X_o_prime axis
+        X_o_prime_axis = tuple([X_o.index(variable) for variable in X_o_prime])
+        P_Y = np.sum(P_X_o_prime_Y_o_Y_m, axis=X_o_prime_axis)
+
+        # Transpose the axis back to Y's order
+        Y_1 = Y_o + Y_m
+        axes = [Y_1.index(variable) for variable in Y]
+        P_Y_transposed = np.transpose(P_Y, axes=axes)
+        return P_Y_transposed
+    
+    # Helper function
+    def fmcar(self, Y, data, cache):
+        '''
+        args:
+        - Y: A list of variables whose marginal distribution is calculated
+
+        Calculate the marginal distribution P(Y)
+        '''
+        self.is_topological(Y)
+        dataset = self.dataset
+        
+        if len(Y) == 0:
+            return 1
+        
+        topological_order = list(nx.topological_sort(self.dataset.bn))
+        cache_index = np.sum(np.array([2 ** topological_order.index(y) if y in Y else 0 for y in topological_order]))
+        if cache[cache_index] is not None:
+            return cache[cache_index]
+        
+        # Initialize set of estimates
+        estimates = []
+
+        for y in Y:
+            # list of y's parent
+            U = Y.copy()
+            U.remove(y)
+            
+            # Get the lists of missing and fully-observed Y
+            Y_m = [variable for variable in Y if variable in dataset.missing_variables]
+            R_Y_m = ["R" + variable for variable in Y_m]
+
+            # Check if all the variable lists are in topological order - easy for debugging
+            assert self.is_topological(Y_m), "Y_m is not in topological order"
+
+            # Conditioning the data on R_Y_m = 'ob'. Including only the columns in Y
+            deleted_data = data[(data[R_Y_m] == 'ob').all(axis=1)][Y]
+            
+            if deleted_data.empty:
+                cache[cache_index] = np.full(shape=[2]*len(Y), fill_value=1./2**len(Y))
+                return cache[cache_index]
+
+            # Calculate P(y, U), P(U)
+            prob = (deleted_data.value_counts(normalize=True)).reset_index(name='prob')
+            
+            if len(U) >= 1:
+                prob_U = (deleted_data[U].value_counts(normalize=True)).reset_index(name='prob_U')
+                
+                # Merging the above 2 DataFrames on the U columns
+                prob_merged = prob.merge(prob_U, on=U, how='left')
+
+                # Match the above probabilities to a numpy array
+                P_y_given_U = np.zeros([2]*len(Y))
+                for i, row in prob_merged.iterrows():
+                    index = tuple(row.iloc[:-2].astype(int))
+                    P_y_given_U[index] = row['prob'] / row['prob_U']
+            else:
+                P_y_given_U = np.array(prob['prob'])
+
+            fmcar_u = self.fmcar(U, data, cache)
+
+            if not isinstance(fmcar_u, int):
+                a_dims = list(range(P_y_given_U.ndim))
+                a_dims.remove(Y.index(y))
+                b_dims = list(range(fmcar_u.ndim))
+                estimates.append(tensor_mult(P_y_given_U, fmcar_u, a_dims, b_dims))
+            else:
+                estimates.append(P_y_given_U)
+        
+        cache[cache_index] = np.mean(estimates, axis=0)
+        
+        return cache[cache_index]
+
+    def idmar(self, Y):
+        '''
+        args:
+        - Y: A list of Y whose marginal distribution is calculated
+
+        Calculate the marginal distribution P(Y)
+        '''
+        self.is_topological(Y)
+        dataset = self.dataset
+        data = dataset.partial_data
+
+        # Get the lists of missing and fully-observed Y
+        Y_m = [variable for variable in Y if variable in dataset.missing_variables]
+        Y_o = [variable for variable in Y if variable not in dataset.missing_variables]
+        R_Y_m = ["R" + variable for variable in Y_m]
+        
+        # Get W_0_prime - the list of parents of R_Y_m outside Y
+        parent_list = []
+        for variable in R_Y_m:
+            parent_list.append(list(dataset.m_graph.predecessors(variable)))
+        W_o = set().union(*parent_list)
+        W_o_prime = self.to_topological_order(list(W_o - set(Y)))
+        W_o = self.to_topological_order(W_o)
+        
+        # Check if all the variable lists are in topological order - easy for debugging
+        for variable_list in [Y_o, Y_m, W_o, W_o_prime]:
+            assert self.is_topological(variable_list), "{} is not in topological order".format(variable_list)
+
+        # Get the proxy_Y_m - the proxy of missing Y
+        proxy_Y_m = ["proxy" + variable for variable in Y_m]
+        
+        # Let A be the union of Y_o and W_o_prime
+        A = Y_o + W_o_prime
+
+        # Calculate the marginals P_D(A)
+        marginals_A = (data[A].value_counts(normalize=True)).reset_index(name='marginals_A')
+
+        # Conditioning the data on R_Y_m = 'ob'. Including only the columns in Y_o, proxy_Y_m, and W_0_prime
+        deleted_data = data[(data[R_Y_m] == 'ob').all(axis=1)][A + proxy_Y_m]
+        
+        # Get the probabilities P(A)
+        prob_A = (deleted_data[A].value_counts(normalize=True)).reset_index(name='prob_A')
+
+        # Calculate P(proxy_Y_m, A)
+        prob = (deleted_data.value_counts(normalize=True)).reset_index(name='prob')
+
+        # Merging the above 2 DataFrames on the A columns
+        prob_merged = prob.merge(prob_A, on=A, how='left').merge(marginals_A, on=A, how='left')
+
+        # Match the above probabilities to a numpy array
+        P_Y = np.zeros([2]*len(A+proxy_Y_m))
+        for i, row in prob_merged.iterrows():
+            index = tuple(row.iloc[:-3].astype(int))
+            P_Y[index] = row['prob'] / row['prob_A'] * row['marginals_A']
+
+        # Take the sum by W_o_prime
+        P_Y_summed = P_Y.sum(axis=tuple(range(len(Y_o), len(A))))
+        
+        # Transpose P_Y_summed so that the axes order matches Y's variable order
+        Y_1 = Y_o + Y_m
+        axes = [Y_1.index(variable) for variable in Y]
+        P_Y_transposed = np.transpose(P_Y_summed, axes=axes)
+
+        P_Y_normalized = P_Y_transposed / P_Y_transposed.sum()
+        
+        return P_Y_normalized
+
+    def ifmar(self, Y):
+        '''
+        args:
+        - Y: A list of Y whose marginal distribution is calculated
+
+        Calculate the marginal distribution P(Y)
+        '''
+        self.is_topological(Y)
+        dataset = self.dataset
+        data = dataset.partial_data
+
+        # Get the lists of missing and fully-observed Y
+        Y_o = [variable for variable in Y if variable not in dataset.missing_variables]
+        Y_m = [variable for variable in Y if variable in dataset.missing_variables]
+        R_Y_m = ["R" + variable for variable in Y_m]
+        X_o = [variable for variable in list(nx.topological_sort(self.dataset.bn)) if variable not in dataset.missing_variables]
+        X_o_prime = self.to_topological_order(list(set(X_o) - set(Y_o)))
+                
+        # Get W_o - the list of R_Y_m's parents
+        parent_list = []
+        for variable in R_Y_m:
+            parent_list.append(list(dataset.m_graph.predecessors(variable)))
+        W_o = self.to_topological_order(list(set().union(*parent_list) & set(X_o)))
+
+        # Check if all the variable lists are in topological order - easy for debugging
+        for variable_list in [Y_o, Y_m, X_o, X_o_prime, W_o]:
+            assert self.is_topological(variable_list), "{} is not in topological order".format(variable_list)
+
+        # Initialize estimated P(X_o_prime, Y_o, Y_m)
+        P_X_o_prime_Y_o_Y_m = np.zeros([2] * len(X_o_prime + Y_o + Y_m))
+
+        # Get the W_o columns of W_o
+        data_W_o = data[W_o] if len(W_o) >= 1 else data
+        
+        # Calculate P(W_o)
+        prob_W_o = (data_W_o.value_counts(normalize=True)).reset_index(name='prob_W_o')
+
+        # Calculate P(X_o) where (X_o = Y_o + X_o_prime)
+        prob_X_o = (data[X_o].value_counts(normalize=True)).reset_index(name='prob_X_o')
+
+        for _, row in prob_W_o.iterrows():
+            partial_data = data[(data_W_o == row.iloc[:-1]).all(axis=1)]
+            cache = [None] * (2 ** len(list(dataset.bn.nodes)))
+            fmcar = self.fmcar(Y_m, partial_data, cache)
+
+            # Choose the rows of prob_X_o whose W_o values correspond to that of the current iteration
+            if len(W_o) >= 1:
+                matching_X_o = prob_X_o[(prob_X_o[W_o] == row.iloc[:-1]).all(axis=1)]
+            else:
+                matching_X_o = prob_X_o
+
+            for __, row_prime in matching_X_o.iterrows():
+                index = tuple(row_prime.iloc[:-1].astype(int))
+                P_X_o_prime_Y_o_Y_m[index] = row_prime['prob_X_o'] * fmcar
+        
+        # Sum out along the X_o_prime axis
+        X_o_prime_axis = tuple([X_o.index(variable) for variable in X_o_prime])
+        P_Y = np.sum(P_X_o_prime_Y_o_Y_m, axis=X_o_prime_axis)
+
+        # Transpose the axis back to Y's order
+        Y_1 = Y_o + Y_m
+        axes = [Y_1.index(variable) for variable in Y]
+        P_Y_transposed = np.transpose(P_Y, axes=axes)
+        
+        return P_Y_transposed
