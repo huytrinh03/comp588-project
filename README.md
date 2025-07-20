@@ -1,1 +1,1 @@
-Replicate the likelihoods and KLD of informed direct/factor deletion for MAR vs direct/factor deletion for MAR.
+# Replicate the likelihoods and KLD of informed direct/factor deletion for MAR vs direct/factor deletion for MAR.
